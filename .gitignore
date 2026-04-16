@@ -1,0 +1,23 @@
+# Datasets (downloaded from Kaggle at runtime)
+data/
+data_breast/
+
+# Model checkpoints and training artifacts (large .pt files)
+artifacts/
+artifacts_breast/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# System
+*.stackdump
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.code-workspace
