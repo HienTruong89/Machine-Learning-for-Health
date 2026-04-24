@@ -17,7 +17,17 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
+# MLflow
+mlflow.db
+mlruns/
+
+# DVC
+.dvc/cache/
+.dvc/tmp/
+
 # IDE
 .vscode/
 .idea/
 *.code-workspace
+/data
+/data_breast

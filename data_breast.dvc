@@ -1,0 +1,6 @@
+outs:
+- md5: a137715af854cdadd207805b25042888.dir
+  size: 266185470
+  nfiles: 1578
+  hash: md5
+  path: data_breast
