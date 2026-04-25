@@ -1,0 +1,98 @@
+name: MLOps Pipeline
+
+# Trigger on every push to master when core ML files change.
+on:
+  push:
+    branches: [master]
+    paths:
+      - mlops_pipeline.py
+      - model.py
+      - serve.py
+      - requirements.txt
+      - Dockerfile
+
+jobs:
+  # ── Job 1: Train and validate ───────────────────────────────────────────────
+  train-and-validate:
+    name: Train · Validate · Register
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install mlflow kagglehub scikit-learn pandas numpy tqdm Pillow
+
+      # ── Stage 2: Data acquisition ──────────────────────────────────────────
+      - name: Download brain tumor dataset
+        env:
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+          KAGGLE_KEY:      ${{ secrets.KAGGLE_KEY }}
+        run: |
+          python mlops_pipeline.py \
+            --task brain_tumor \
+            --epochs 1 \
+            --batch 16 \
+            --min_val_acc 0.0 \
+            --min_auroc 0.0
+
+      # ── Stage 8-9: Validate quality gate ──────────────────────────────────
+      - name: Validate brain tumor accuracy threshold
+        run: |
+          python - <<'EOF'
+          import json, sys
+          r   = json.load(open("artifacts_brain/test_report.json"))
+          acc = r["test_accuracy"]
+          print(f"Test accuracy: {acc:.2%}")
+          if acc < 0.30:
+              print(f"FAIL: accuracy {acc:.2%} below 30% smoke-test threshold")
+              sys.exit(1)
+          print("PASS")
+          EOF
+
+      # ── Upload artifacts ───────────────────────────────────────────────────
+      - name: Upload brain tumor model
+        uses: actions/upload-artifact@v4
+        with:
+          name: brain-tumor-model
+          path: |
+            artifacts_brain/best_model.pt
+            artifacts_brain/model.torchscript
+            artifacts_brain/test_report.json
+            artifacts_brain/history.csv
+
+  # ── Job 2: Build Docker image (local CI check, no push) ────────────────────
+  # NOTE: Azure push/deploy is enabled in AZURE_GUIDE.md (requires ACR secrets).
+  # For now this job just verifies the image builds successfully after training.
+  docker-build:
+    name: Docker Build (smoke test)
+    runs-on: ubuntu-latest
+    needs: train-and-validate     # only runs if training passed
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download trained model artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: brain-tumor-model
+          path: artifacts_brain/
+
+      # The Dockerfile copies both models. In CI we only train brain_tumor,
+      # so create a 1-byte placeholder so the COPY step doesn't fail.
+      # The breast_cancer endpoint returns 503 until a real model is present.
+      - name: Create breast cancer model placeholder (CI only)
+        run: mkdir -p artifacts_breast && dd if=/dev/zero bs=1 count=1 of=artifacts_breast/best_model.pt
+
+      - name: Build Docker image
+        run: docker build -t medical-imaging-api:ci .
