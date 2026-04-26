@@ -24,5 +24,3 @@ evidently>=0.4.0
 # Data versioning (Azure remote)
 dvc[azure]>=3.0.0
 
- 
-.
