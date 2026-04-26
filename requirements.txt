@@ -1,11 +1,16 @@
 # Core ML
-torch>=2.0.0
-torchvision>=0.15.0
-Pillow>=10.0.0
-numpy>=1.24.0
+torch==2.1.2
+torchvision==0.16.2
+Pillow==10.2.0
+numpy==1.26.4
 pandas>=2.0.0
 scikit-learn>=1.3.0
 tqdm>=4.65.0
+
+# Streamlit app
+plotly==5.18.0
+streamlit==1.32.0
+huggingface_hub==0.20.3
 
 # MLOps — experiment tracking & model registry
 mlflow>=2.10.0
@@ -17,10 +22,4 @@ kagglehub>=0.2.0
 fastapi>=0.111.0
 uvicorn[standard]>=0.30.0
 python-multipart>=0.0.9
-
-# Drift monitoring
-evidently>=0.4.0
-
-# Data versioning (Azure remote)
-dvc[azure]>=3.0.0
 
