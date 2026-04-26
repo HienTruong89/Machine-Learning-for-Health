@@ -139,11 +139,17 @@ st.subheader("Model Status")
 col1, col2, col3, col4 = st.columns(4)
 
 if report:
-    gate = report.get("gate_passed")
-    col1.metric("Test accuracy",  f"{report.get('test_accuracy',    0):.2%}")
-    col2.metric("Best val acc",   f"{report.get('best_val_acc',     0):.2%}")
-    col3.metric("Test AUROC",     f"{report.get('test_macro_auroc', 0):.4f}")
-    col4.metric("Quality gate",   "PASS" if gate else "FAIL" if gate is not None else "N/A")
+    val_acc   = report.get("best_val_acc",     0)
+    auroc     = report.get("test_macro_auroc", 0)
+    min_acc   = config.get("min_val_acc",  0.95)
+    min_auroc = config.get("min_auroc",    0.90)
+    gate      = val_acc >= min_acc and auroc >= min_auroc
+
+    col1.metric("Test accuracy", f"{report.get('test_accuracy', 0):.2%}")
+    col2.metric("Best val acc",  f"{val_acc:.2%}")
+    col3.metric("Test AUROC",    f"{auroc:.4f}")
+    col4.metric("Quality gate",  "PASS" if gate else "FAIL",
+                delta=f"acc≥{min_acc:.0%} & auroc≥{min_auroc}")
 
 if config:
     with st.expander("Run config"):
