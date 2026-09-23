@@ -9,15 +9,9 @@ on:
       - serve.py
       - requirements.txt
       - Dockerfile
-  # Manual trigger — enter Kaggle credentials directly in the GitHub UI
+  # Manual trigger (Actions tab → Run workflow). Kaggle credentials come from
+  # repository secrets only; workflow inputs are not masked in the run UI.
   workflow_dispatch:
-    inputs:
-      kaggle_user:
-        description: "Kaggle username"
-        required: true
-      kaggle_key:
-        description: "Kaggle API key"
-        required: true
 
 jobs:
   # ── Job 1: Train and validate ───────────────────────────────────────────────
@@ -41,11 +35,10 @@ jobs:
           pip install mlflow kagglehub scikit-learn pandas numpy tqdm Pillow
 
       # ── Stage 2: Data acquisition ──────────────────────────────────────────
-      # Credentials come from secrets (push trigger) or manual inputs (workflow_dispatch)
       - name: Download brain tumor dataset
         env:
-          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME || inputs.kaggle_user }}
-          KAGGLE_KEY:      ${{ secrets.KAGGLE_KEY || inputs.kaggle_key }}
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+          KAGGLE_KEY:      ${{ secrets.KAGGLE_KEY }}
         run: |
           python mlops_pipeline.py \
             --task brain_tumor \

@@ -98,7 +98,7 @@ Not verified: the Docker build (no Docker run here), the GitHub Actions run, the
 ## Findings to decide on (not changed)
 
 1. **README results don't match the artifacts on disk.** The README reports breast test accuracy 82.9%, AUROC 0.912 and malignant recall 0.677. `artifacts_breast/test_report.json` (26 Apr) shows 84.6%, 0.905 and **0.806**. One of them is from an older run. Pick the canonical run and make the README match it.
-2. **The Kaggle key as a `workflow_dispatch` input** (your uncommitted `mlops.yml` change): inputs are not masked like secrets and appear in the run's UI and event payload. Prefer repository secrets only.
+2. ~~Kaggle key as a `workflow_dispatch` input~~ — fixed in a follow-up commit: the manual trigger stays, credentials come from repository secrets only.
 3. **Grad-CAM on the real brain model highlights the skull edge, not the tumour**, while occlusion does find the lesion. This is the same with the old code, so it is a model finding, not a refactor bug. It is worth a line in "Known issues", since reviewers ask about it.
 4. Streamlit warns that `use_container_width` is deprecated in both apps. Harmless for now, but it will break on a future Streamlit version.
 5. `MLOPS_GUIDE.md`, `DEPLOYMENT_GUIDE.md` and `AZURE_GUIDE.md` overlap heavily with `documentation/`. Consider folding them in or deleting them.
