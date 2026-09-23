@@ -4,51 +4,45 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository overview
 
-A single-script PyTorch project for multi-class brain tumor MRI classification (4 classes: glioma, meningioma, notumor, pituitary) using transfer learning on ResNet50. The companion `ML_Medical_Imaging_Tutorial.md` is a long-form tutorial document; `train_brain_tumor.py` is the actual runnable pipeline.
+PyTorch transfer-learning classifiers (ResNet50, ImageNet V2 weights) for two medical imaging tasks, plus the MLOps around them:
+
+| Task key | Classes | Data dir | Artifacts dir |
+|---|---|---|---|
+| `brain_tumor` | glioma, meningioma, notumor, pituitary | `data/Training|Testing/<class>/` | `artifacts_brain/` |
+| `breast_cancer` | benign, malignant, normal | `data_breast/<class>/` (mask files skipped) | `artifacts_breast/` |
+
+## Files
+
+- `mlops_pipeline.py` — the only training entry point. Ten stages: config → Kaggle download (kagglehub) → data validation → splits/transforms → MLflow run → model → training (early stopping) → test evaluation → quality gate → TorchScript export + MLflow registry. Per-task settings (dataset slug, layout, gate thresholds) live in `TASK_META`.
+- `model.py` — `build_model`, `eval_transform`, `load_checkpoint`. Shared by every other script; the Dockerfile copies only `model.py` + `serve.py`, so keep it free of training-only deps.
+- `explain.py --task <task>` — Grad-CAM, Grad-CAM++, Integrated Gradients, Occlusion; samples from `<artifacts>/test_images.csv`.
+- `serve.py` — FastAPI (`/health`, `/predict/{task}`); `batch_predict.py` is its CLI client.
+- `patient_app.py`, `dashboard.py` — Streamlit apps (deployed on Streamlit Cloud; fetch artifacts from HF Hub `Slakje89/medical-imaging-models` when missing; deps in `requirements-app.txt`).
+- `documentation/` — stage-by-stage reference docs that quote function names from `mlops_pipeline.py`. Update them if you rename those functions.
 
 ## Common commands
 
-Run full pipeline (download dataset if missing, train, evaluate):
-
 ```bash
-python train_brain_tumor.py
+python mlops_pipeline.py --task brain_tumor                    # full run, auto-downloads data
+python mlops_pipeline.py --task breast_cancer --epochs 25 --batch 32
+python explain.py --task brain_tumor --n 8
+uvicorn serve:app --port 8000
+streamlit run patient_app.py
+mlflow ui --backend-store-uri sqlite:///mlflow.db
 ```
 
-Skip auto-download (data already on disk) and override hyperparameters:
+Kaggle credentials: `--kaggle_user/--kaggle_key` → `KAGGLE_USERNAME`/`KAGGLE_KEY` env vars → `~/.kaggle/kaggle.json`.
 
-```bash
-python train_brain_tumor.py --data data --epochs 20 --batch 32 --lr 3e-4 --img_size 224
-```
+There is no test suite. Quick end-to-end check: create a small synthetic dataset (≥10 images per class) and run `mlops_pipeline.py --data <dir> --out <dir> --epochs 1 --img_size 64 --mlflow_uri sqlite:///<tmp>/mlflow.db`.
 
-Pass Kaggle credentials inline (otherwise resolved from `KAGGLE_USERNAME`/`KAGGLE_KEY` env vars or `~/.kaggle/kaggle.json`):
+## Checkpoint contract
 
-```bash
-python train_brain_tumor.py --kaggle_user <name> --kaggle_key <key>
-```
+`best_model.pt` holds `state_dict`, `classes`, `img_size`, `mean`, `std`, `epoch`, `val_acc`, and is loaded with `weights_only=True`. Serving, the apps and `explain.py` all depend on it via `model.load_checkpoint`, so change it in one place only.
 
-There is no test suite, linter, or build step — the project is one script plus artifacts.
+## CI
 
-## Architecture
-
-`train_brain_tumor.py` is a linear end-to-end pipeline with these stages in `main()`:
-
-1. **Dataset acquisition** (`download_dataset`) — shells out to the Kaggle **CLI executable** (never the Python `kaggle` module, to avoid the `KaggleApiExtended`/`__main__.py` breakage in kaggle v1.6+). Credential resolution order: CLI flags → env vars → `~/.kaggle/kaggle.json`. Writes `kaggle.json` *before* any kaggle import because newer versions authenticate at import time. `_kaggle_exe()` searches PATH, then the conda `Scripts/` dir next to `sys.executable`, then user site-packages.
-2. **Indexing** (`index_folder`) — walks `data/Training/<class>/` and `data/Testing/<class>/`, verifies each image with `PIL.Image.verify()`, and builds a DataFrame with `ok`/`err` flags so corrupt files are skipped rather than crashing training.
-3. **Splits** — `Training/` is stratified-split 85/15 into train/val; `Testing/` is held out as the test set.
-4. **Transforms** — grayscale→3-channel (so ImageNet-pretrained weights apply), ImageNet normalization, augmentation only on train (flip, rotate, jitter, affine, RandomErasing).
-5. **Model** (`build_model`) — ResNet50 with ImageNet V2 weights; the final `fc` is replaced with a 2-layer MLP head (Dropout 0.3 → Linear 512 → ReLU → Dropout → Linear num_classes).
-6. **Training** (`run_epoch`) — single function for both train and eval, branching on `optimizer is not None`. Uses `CrossEntropyLoss` with **class-frequency-inverse weights** and label smoothing 0.05, AdamW, CosineAnnealingLR, and `torch.cuda.amp` mixed-precision when CUDA is present. Best checkpoint (by val acc) is saved to `artifacts/best_model.pt` containing `state_dict`, `classes`, `img_size`, `mean`, `std` — everything needed for standalone inference.
-7. **Evaluation** — reloads the best checkpoint and emits `artifacts/history.csv` and `artifacts/test_report.json` (classification report, confusion matrix, macro OvR AUROC).
-
-## Expected data layout
-
-```
-data/Training/<class>/*.jpg
-data/Testing/<class>/*.jpg
-```
-
-Any other layout will produce an empty index DataFrame and a `FileNotFoundError`.
+`.github/workflows/mlops.yml` trains `brain_tumor` for one epoch on CPU as a smoke test (30% accuracy floor), then builds the Docker image. It proves the pipeline runs, not that the model is good.
 
 ## Platform notes
 
-Primary dev environment is Windows (shell is bash/Git-Bash). The Kaggle credential file `chmod(0o600)` call is wrapped in try/except because Windows does not support POSIX perms. Use forward slashes in paths when invoking commands.
+Primary dev environment is Windows (Git-Bash / PowerShell). `chmod(0o600)` on `kaggle.json` is wrapped in try/except because Windows has no POSIX perms.

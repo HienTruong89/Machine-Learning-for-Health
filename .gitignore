@@ -32,3 +32,10 @@ mlruns/
 *.code-workspace
 /data
 /data_breast
+
+# Claude Code
+.claude/
+
+# Ad-hoc prediction outputs
+glioma_results.csv
+results.csv

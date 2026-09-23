@@ -806,8 +806,8 @@ ENV PYTHONUNBUFFERED=1
 ```
 Developer's laptop
        │
-       │  python train_brain_tumor_v2.py
-       │  → artifacts/best_model.pt
+       │  python mlops_pipeline.py --task brain_tumor
+       │  → artifacts_brain/best_model.pt
        │
        ▼
   Docker build
@@ -841,8 +841,8 @@ Developer's laptop
 
 **Step 1 — Train the model:**
 ```bash
-python train_brain_tumor_v2.py --epochs 20
-# produces: artifacts/best_model.pt
+python mlops_pipeline.py --task brain_tumor --epochs 20
+# produces: artifacts_brain/best_model.pt
 ```
 
 **Step 2 — Test the API locally (no Docker):**

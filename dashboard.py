@@ -6,7 +6,6 @@ Run locally:  streamlit run dashboard.py
 Deployed at:  Streamlit Cloud (reads artifacts from Hugging Face Hub)
 """
 
-import io
 import json
 from pathlib import Path
 
@@ -17,9 +16,8 @@ import plotly.graph_objects as go
 import streamlit as st
 import torch
 from PIL import Image
-from torchvision import transforms
 
-from model import build_model
+from model import load_checkpoint
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -61,7 +59,7 @@ def ensure_artifacts(artifacts: Path):
     missing = [f for f in ARTIFACT_FILES if not (artifacts / f).exists()]
     if not missing:
         return
-    with st.spinner(f"Downloading artifacts from Hugging Face Hub..."):
+    with st.spinner("Downloading artifacts from Hugging Face Hub..."):
         for fname in missing:
             try:
                 hf_hub_download(
@@ -92,17 +90,7 @@ def load_model_for_task(artifacts_str: str):
     ckpt_path = artifacts / "best_model.pt"
     if not ckpt_path.exists():
         return None, None, None
-    ckpt  = torch.load(ckpt_path, map_location="cpu", weights_only=True)
-    model = build_model(len(ckpt["classes"]))
-    model.load_state_dict(ckpt["state_dict"])
-    model.eval()
-    tfm = transforms.Compose([
-        transforms.Grayscale(num_output_channels=3),
-        transforms.Resize((ckpt["img_size"], ckpt["img_size"])),
-        transforms.ToTensor(),
-        transforms.Normalize(ckpt["mean"], ckpt["std"]),
-    ])
-    return model, ckpt["classes"], tfm
+    return load_checkpoint(ckpt_path)
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 

@@ -1,6 +1,5 @@
 name: MLOps Pipeline
 
-# Trigger on every push to master when core ML files change.
 on:
   push:
     branches: [master]
@@ -10,6 +9,15 @@ on:
       - serve.py
       - requirements.txt
       - Dockerfile
+  # Manual trigger — enter Kaggle credentials directly in the GitHub UI
+  workflow_dispatch:
+    inputs:
+      kaggle_user:
+        description: "Kaggle username"
+        required: true
+      kaggle_key:
+        description: "Kaggle API key"
+        required: true
 
 jobs:
   # ── Job 1: Train and validate ───────────────────────────────────────────────
@@ -33,10 +41,11 @@ jobs:
           pip install mlflow kagglehub scikit-learn pandas numpy tqdm Pillow
 
       # ── Stage 2: Data acquisition ──────────────────────────────────────────
+      # Credentials come from secrets (push trigger) or manual inputs (workflow_dispatch)
       - name: Download brain tumor dataset
         env:
-          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
-          KAGGLE_KEY:      ${{ secrets.KAGGLE_KEY }}
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME || inputs.kaggle_user }}
+          KAGGLE_KEY:      ${{ secrets.KAGGLE_KEY || inputs.kaggle_key }}
         run: |
           python mlops_pipeline.py \
             --task brain_tumor \

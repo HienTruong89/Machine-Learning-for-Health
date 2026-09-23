@@ -19,9 +19,8 @@ from pathlib import Path
 import torch
 from fastapi import FastAPI, HTTPException, UploadFile
 from PIL import Image
-from torchvision import transforms
 
-from model import build_model
+from model import load_checkpoint
 
 app = FastAPI(
     title="Medical Imaging Classifier",
@@ -59,19 +58,7 @@ def _load_model(task: str):
             detail=f"Checkpoint not found: {path}. Run: python mlops_pipeline.py --task {task}",
         )
 
-    ckpt  = torch.load(path, map_location=DEVICE, weights_only=True)
-    model = build_model(len(ckpt["classes"]))
-    model.load_state_dict(ckpt["state_dict"])
-    model.to(DEVICE).eval()
-
-    tfm = transforms.Compose([
-        transforms.Grayscale(num_output_channels=3),
-        transforms.Resize((ckpt["img_size"], ckpt["img_size"])),
-        transforms.ToTensor(),
-        transforms.Normalize(ckpt["mean"], ckpt["std"]),
-    ])
-
-    _model_cache[task] = (model, ckpt["classes"], tfm)
+    _model_cache[task] = load_checkpoint(path, DEVICE)
     return _model_cache[task]
 
 
@@ -98,9 +85,10 @@ async def predict(task: str, file: UploadFile):
 
     x = tfm(img).unsqueeze(0).to(DEVICE)
     with torch.no_grad():
-        probs = torch.softmax(model(x), dim=1)[0].cpu().tolist()
+        probs = torch.softmax(model(x), dim=1)[0]
 
-    top_idx = int(torch.tensor(probs).argmax())
+    top_idx = int(probs.argmax())
+    probs   = probs.cpu().tolist()
     return {
         "task":        task,
         "prediction":  classes[top_idx],

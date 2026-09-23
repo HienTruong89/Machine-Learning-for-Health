@@ -6,7 +6,8 @@ Run with:
     streamlit run patient_app.py
 """
 
-import io
+import datetime
+import json
 from pathlib import Path
 
 import numpy as np
@@ -14,9 +15,8 @@ import plotly.graph_objects as go
 import streamlit as st
 import torch
 from PIL import Image
-from torchvision import transforms
 
-from model import build_model
+from model import load_checkpoint
 
 # ── HF Hub model download ──────────────────────────────────────────────────────
 # Set HF_REPO to your Hugging Face model repo, e.g. "YourUsername/medical-imaging-models"
@@ -29,7 +29,7 @@ def ensure_model(artifacts: Path) -> bool:
         return True
     try:
         from huggingface_hub import hf_hub_download
-        with st.spinner(f"Downloading model from Hugging Face Hub..."):
+        with st.spinner("Downloading model from Hugging Face Hub..."):
             hf_hub_download(
                 repo_id=HF_REPO,
                 filename=f"{artifacts.name}/best_model.pt",
@@ -120,20 +120,7 @@ RISK_FLAGS = {
 
 @st.cache_resource
 def load_model(artifacts: Path):
-    ckpt_path = artifacts / "best_model.pt"
-    if not ckpt_path.exists():
-        return None, None, None
-    ckpt  = torch.load(ckpt_path, map_location="cpu", weights_only=True)
-    model = build_model(len(ckpt["classes"]))
-    model.load_state_dict(ckpt["state_dict"])
-    model.eval()
-    tfm = transforms.Compose([
-        transforms.Grayscale(num_output_channels=3),
-        transforms.Resize((ckpt["img_size"], ckpt["img_size"])),
-        transforms.ToTensor(),
-        transforms.Normalize(ckpt["mean"], ckpt["std"]),
-    ])
-    return model, ckpt["classes"], tfm
+    return load_checkpoint(artifacts / "best_model.pt")
 
 # ── Header ────────────────────────────────────────────────────────────────────
 
@@ -274,7 +261,7 @@ with st.expander("Add patient details (optional)"):
     notes       = st.text_area("Clinical notes", height=80)
 
     if st.button("Save report"):
-        import json, datetime
+        now = datetime.datetime.now()
         report = {
             "patient_id":  patient_id,
             "scan_date":   str(scan_date),
@@ -285,9 +272,9 @@ with st.expander("Add patient details (optional)"):
             "risk_label":  risk_label,
             "probabilities": {c: round(p, 4) for c, p in zip(classes, probs)},
             "notes":       notes,
-            "timestamp":   datetime.datetime.now().isoformat(),
+            "timestamp":   now.isoformat(),
         }
-        out_path = Path(f"report_{patient_id or 'patient'}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
+        out_path = Path(f"report_{patient_id or 'patient'}_{now:%Y%m%d_%H%M%S}.json")
         out_path.write_text(json.dumps(report, indent=2))
         st.success(f"Report saved to {out_path}")
         st.json(report)

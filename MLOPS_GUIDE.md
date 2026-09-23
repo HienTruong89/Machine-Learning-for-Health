@@ -2,6 +2,8 @@
 
 A practical introduction to MLOps using the medical imaging project in this repository as a running example.
 
+> **Historical note:** this guide was written before `mlops_pipeline.py` existed, so its examples refer to earlier scripts (`train_brain_tumor_v2.py`, `predict_app.py`) that have since been removed. The steps it proposes are now implemented in `mlops_pipeline.py`; see `documentation/` for the current reference.
+
 ---
 
 ## What is MLOps?

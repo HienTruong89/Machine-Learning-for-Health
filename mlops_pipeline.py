@@ -12,7 +12,7 @@ Ten explicit MLOps stages:
                                   dataset fingerprint
   4.  Feature engineering       — augmentation pipeline, stratified splits
   5.  Experiment tracking       — MLflow experiment + run (params, tags)
-  6.  Model building            — ResNet50 transfer-learning head
+  6.  Model building            — ResNet50 transfer-learning head (model.py)
   7.  Model training            — AMP, AdamW, CosineAnnealingLR, early stopping
   8.  Model evaluation          — classification report, confusion matrix, AUROC
   9.  Model validation gate     — reject model below accuracy / AUROC thresholds
@@ -32,8 +32,8 @@ import hashlib
 import json
 import logging
 import os
+import random
 import shutil
-import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -49,9 +49,9 @@ from sklearn.model_selection import train_test_split
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
-from torchvision.models import ResNet50_Weights, resnet50
-from model import build_model
 from tqdm import tqdm
+
+from model import IMAGENET_MEAN, IMAGENET_STD, build_model, eval_transform
 
 log = logging.getLogger(__name__)
 
@@ -81,7 +81,7 @@ class Config:
         path.write_text(json.dumps(asdict(self), indent=2))
 
 
-# Per-task static metadata (dataset IDs, folder layouts, file-type filters)
+# Per-task static metadata (dataset IDs, folder layouts, file-type filters, gates)
 TASK_META = {
     "brain_tumor": {
         "kaggle_dataset": "masoudnickparvar/brain-tumor-mri-dataset",
@@ -93,6 +93,8 @@ TASK_META = {
         "experiment":     "brain-tumor-classification",
         "check_file_glob": "*.jpg",
         "check_subdir":   "Training",
+        "min_val_acc":    0.95,             # 4-class MRI — high bar
+        "min_auroc":      0.90,
     },
     "breast_cancer": {
         "kaggle_dataset": "aryashah2k/breast-ultrasound-images-dataset",
@@ -104,11 +106,10 @@ TASK_META = {
         "experiment":     "breast-cancer-classification",
         "check_file_glob": "*.png",
         "check_subdir":   "benign",
+        "min_val_acc":    0.90,             # 3-class ultrasound — adjusted threshold
+        "min_auroc":      0.90,
     },
 }
-
-IMAGENET_MEAN = [0.485, 0.456, 0.406]
-IMAGENET_STD  = [0.229, 0.224, 0.225]
 
 
 def parse_args() -> Config:
@@ -129,10 +130,10 @@ def parse_args() -> Config:
     ap.add_argument("--img_size",    type=int,   default=224)
     ap.add_argument("--patience",    type=int,   default=5,
                     help="Early-stopping patience in epochs.")
-    ap.add_argument("--min_val_acc", type=float, default=0.80,
-                    help="Deployment gate: minimum validation accuracy.")
-    ap.add_argument("--min_auroc",   type=float, default=0.90,
-                    help="Deployment gate: minimum macro OvR AUROC.")
+    ap.add_argument("--min_val_acc", type=float, default=None,
+                    help="Deployment gate: minimum validation accuracy (default: per-task).")
+    ap.add_argument("--min_auroc",   type=float, default=None,
+                    help="Deployment gate: minimum macro OvR AUROC (default: per-task).")
     ap.add_argument("--seed",        type=int,   default=42)
     ap.add_argument("--mlflow_uri",  type=str,   default="sqlite:///mlflow.db",
                     help="MLflow tracking URI.")
@@ -150,8 +151,8 @@ def parse_args() -> Config:
         lr=a.lr,
         img_size=a.img_size,
         patience=a.patience,
-        min_val_acc=a.min_val_acc,
-        min_auroc=a.min_auroc,
+        min_val_acc=a.min_val_acc if a.min_val_acc is not None else meta["min_val_acc"],
+        min_auroc=a.min_auroc     if a.min_auroc   is not None else meta["min_auroc"],
         seed=a.seed,
         mlflow_uri=a.mlflow_uri,
         experiment=meta["experiment"],
@@ -159,7 +160,6 @@ def parse_args() -> Config:
 
 
 def set_seed(seed: int) -> None:
-    import random
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -181,7 +181,7 @@ def _ensure_kaggle_credentials(cfg: Config) -> None:
         cred.parent.mkdir(exist_ok=True)
         cred.write_text(json.dumps({"username": user, "key": key}))
         try:
-            cred.chmod(0o600)
+            cred.chmod(0o600)   # no-op on Windows
         except Exception:
             pass
         log.info("Kaggle credentials written to %s", cred)
@@ -206,14 +206,7 @@ def download_dataset(cfg: Config) -> None:
         return
 
     _ensure_kaggle_credentials(cfg)
-
-    try:
-        import kagglehub
-    except ImportError:
-        log.info("kagglehub not found — installing ...")
-        import subprocess
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "kagglehub", "-q"])
-        import kagglehub  # noqa: F811
+    import kagglehub  # imported here: it authenticates on import, so credentials must exist first
 
     log.info("Downloading '%s' via kagglehub ...", meta["kaggle_dataset"])
     src = Path(kagglehub.dataset_download(meta["kaggle_dataset"]))
@@ -221,22 +214,26 @@ def download_dataset(cfg: Config) -> None:
     data_dir.mkdir(parents=True, exist_ok=True)
     for item in src.iterdir():
         dest = data_dir / item.name
-        if not dest.exists():
-            if item.is_dir():
-                shutil.copytree(str(item), str(dest))
-            else:
-                shutil.copy2(str(item), str(dest))
+        if dest.exists():
+            continue
+        if item.is_dir():
+            shutil.copytree(item, dest)
+        else:
+            shutil.copy2(item, dest)
 
     # Flatten known nested archive sub-dirs
     for nested_name in ["brain-tumor-mri-dataset", "Dataset_BUSI_with_GT"]:
         nested = data_dir / nested_name
-        if nested.exists():
-            for item in nested.iterdir():
-                dest = data_dir / item.name
-                if dest.exists():
-                    shutil.rmtree(str(dest)) if dest.is_dir() else dest.unlink()
-                shutil.move(str(item), str(dest))
-            nested.rmdir()
+        if not nested.exists():
+            continue
+        for item in nested.iterdir():
+            dest = data_dir / item.name
+            if dest.is_dir():
+                shutil.rmtree(dest)
+            elif dest.exists():
+                dest.unlink()
+            shutil.move(str(item), str(dest))
+        nested.rmdir()
 
     log.info("Dataset ready at '%s'.", data_dir)
 
@@ -246,38 +243,35 @@ def download_dataset(cfg: Config) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def index_images(cfg: Config) -> pd.DataFrame:
-    meta      = TASK_META[cfg.task]
-    data_dir  = Path(cfg.data)
-    exts      = meta["image_exts"]
-    rows: list = []
+    """One row per image file: path, split, label, ok (opens cleanly), err."""
+    meta     = TASK_META[cfg.task]
+    data_dir = Path(cfg.data)
 
     if meta["layout"] == "split":
         scan_roots = [(data_dir / s, s) for s in ["Training", "Testing"]]
     else:
         scan_roots = [(data_dir, "all")]
 
+    rows = []
     for root, split in scan_roots:
         if not root.exists():
             continue
-        for cls_dir in sorted(root.iterdir()):
-            if not cls_dir.is_dir():
-                continue
+        for cls_dir in sorted(p for p in root.iterdir() if p.is_dir()):
             for p in cls_dir.glob("*"):
-                if p.suffix.lower() not in exts:
+                if p.suffix.lower() not in meta["image_exts"]:
                     continue
                 if meta["mask_filter"] and "mask" in p.name.lower():
                     continue
                 try:
                     with Image.open(p) as im:
                         im.verify()
-                    rows.append({"path": str(p), "split": split,
-                                 "label": cls_dir.name, "ok": True, "err": None})
+                    ok, err = True, None
                 except Exception as exc:
-                    rows.append({"path": str(p), "split": split,
-                                 "label": cls_dir.name, "ok": False, "err": str(exc)})
+                    ok, err = False, str(exc)
+                rows.append({"path": str(p), "split": split,
+                             "label": cls_dir.name, "ok": ok, "err": err})
 
-    cols = ["path", "split", "label", "ok", "err"]
-    return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
+    return pd.DataFrame(rows, columns=["path", "split", "label", "ok", "err"])
 
 
 def validate_data(df: pd.DataFrame) -> dict:
@@ -295,9 +289,9 @@ def validate_data(df: pd.DataFrame) -> dict:
             "Inspect the dataset before continuing."
         )
 
-    df_ok      = df[df["ok"]]
-    per_class  = df_ok.groupby("label").size().to_dict()
-    min_count  = min(per_class.values()) if per_class else 0
+    df_ok     = df[df["ok"]]
+    per_class = df_ok.groupby("label").size().to_dict()
+    min_count = min(per_class.values()) if per_class else 0
 
     if min_count < 10:
         raise ValueError(
@@ -327,6 +321,7 @@ def validate_data(df: pd.DataFrame) -> dict:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def build_transforms(img_size: int):
+    """Return (train_tfm, eval_tfm). Augmentation is applied to training only."""
     train_tfm = transforms.Compose([
         transforms.Grayscale(num_output_channels=3),
         transforms.Resize((img_size, img_size)),
@@ -339,29 +334,22 @@ def build_transforms(img_size: int):
         transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
         transforms.RandomErasing(p=0.25, scale=(0.02, 0.1)),
     ])
-    eval_tfm = transforms.Compose([
-        transforms.Grayscale(num_output_channels=3),
-        transforms.Resize((img_size, img_size)),
-        transforms.ToTensor(),
-        transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
-    ])
-    return train_tfm, eval_tfm
+    return train_tfm, eval_transform(img_size)
 
 
 def build_splits(df: pd.DataFrame, cfg: Config):
     """Return (train_df, val_df, test_df, classes, class_to_idx)."""
-    meta  = TASK_META[cfg.task]
-    df_ok = df[df["ok"]].copy()
+    df_ok = df[df["ok"]]
 
-    if meta["layout"] == "split":
-        # Brain tumor: pre-defined Training / Testing folders
+    if TASK_META[cfg.task]["layout"] == "split":
+        # Brain tumor: pre-defined Training / Testing folders, val carved from Training
         train_all = df_ok[df_ok["split"] == "Training"]
         test_df   = df_ok[df_ok["split"] == "Testing"]
         train_df, val_df = train_test_split(
             train_all, test_size=0.15, stratify=train_all["label"], random_state=cfg.seed
         )
     else:
-        # Breast cancer: stratified 70 / 15 / 15 from single pool
+        # Breast cancer: stratified 70 / 15 / 15 from a single pool
         train_df, tmp = train_test_split(
             df_ok, test_size=0.30, stratify=df_ok["label"], random_state=cfg.seed
         )
@@ -373,15 +361,15 @@ def build_splits(df: pd.DataFrame, cfg: Config):
     class_to_idx = {c: i for i, c in enumerate(classes)}
     log.info("Split sizes — train: %d  val: %d  test: %d  classes: %s",
              len(train_df), len(val_df), len(test_df), classes)
-    return train_df.reset_index(drop=True), val_df.reset_index(drop=True), \
-           test_df.reset_index(drop=True), classes, class_to_idx
+    return (train_df.reset_index(drop=True), val_df.reset_index(drop=True),
+            test_df.reset_index(drop=True), classes, class_to_idx)
 
 
 class ImageDataset(Dataset):
     def __init__(self, df: pd.DataFrame, class_to_idx: dict, tfm):
-        self.df          = df
+        self.df           = df
         self.class_to_idx = class_to_idx
-        self.tfm         = tfm
+        self.tfm          = tfm
 
     def __len__(self) -> int:
         return len(self.df)
@@ -392,13 +380,17 @@ class ImageDataset(Dataset):
         return self.tfm(img), self.class_to_idx[r["label"]]
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Stage 6 · Model building  (build_model imported from model.py)
-# ══════════════════════════════════════════════════════════════════════════════
+def make_loader(df: pd.DataFrame, class_to_idx: dict, tfm, cfg: Config,
+                shuffle: bool = False) -> DataLoader:
+    return DataLoader(
+        ImageDataset(df, class_to_idx, tfm),
+        batch_size=cfg.batch, shuffle=shuffle,
+        num_workers=min(4, os.cpu_count() or 1), pin_memory=True,
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Stage 7 · Training helpers
+# Stage 7 · Training
 # ══════════════════════════════════════════════════════════════════════════════
 
 class EarlyStopping:
@@ -408,35 +400,36 @@ class EarlyStopping:
         self.patience  = patience
         self.min_delta = min_delta
         self.counter   = 0
-        self.best = None
-        self.triggered = False
+        self.best      = None
 
     def __call__(self, val_acc: float) -> bool:
+        """Record this epoch's val_acc; return True when training should stop."""
         if self.best is None or val_acc > self.best + self.min_delta:
             self.best    = val_acc
             self.counter = 0
         else:
             self.counter += 1
-            if self.counter >= self.patience:
-                self.triggered = True
-        return self.triggered
+        return self.counter >= self.patience
 
 
 def run_epoch(model, loader, criterion, device,
               optimizer=None, scaler=None, desc: str = "") -> tuple:
+    """One pass over `loader`. Trains if an optimizer is given, otherwise evaluates.
+    Returns (mean loss, accuracy)."""
     is_train = optimizer is not None
     model.train(is_train)
     total, correct, loss_sum = 0, 0, 0.0
-    ctx = torch.enable_grad() if is_train else torch.no_grad()
-    with ctx:
+    with torch.set_grad_enabled(is_train):
         for x, y in tqdm(loader, leave=False, desc=desc or ("train" if is_train else "eval")):
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
+            # Mixed precision only while training on CUDA (scaler is None on CPU)
+            with torch.amp.autocast(device_type=device.type,
+                                    enabled=is_train and scaler is not None):
+                out  = model(x)
+                loss = criterion(out, y)
             if is_train:
                 optimizer.zero_grad()
-                with torch.amp.autocast(device_type=device.type, enabled=scaler is not None):
-                    out  = model(x)
-                    loss = criterion(out, y)
                 if scaler is not None:
                     scaler.scale(loss).backward()
                     scaler.step(optimizer)
@@ -444,13 +437,74 @@ def run_epoch(model, loader, criterion, device,
                 else:
                     loss.backward()
                     optimizer.step()
-            else:
-                out  = model(x)
-                loss = criterion(out, y)
             loss_sum += loss.item() * x.size(0)
             correct  += (out.argmax(1) == y).sum().item()
             total    += x.size(0)
     return loss_sum / total, correct / total
+
+
+def train_model(model, train_loader, val_loader, train_df, classes,
+                cfg: Config, device, ckpt_path: Path, mlflow):
+    """Train with early stopping, saving the best-val_acc checkpoint.
+    Returns (best_val_acc, history rows)."""
+    # Inverse-frequency class weights counter the class imbalance
+    counts = train_df["label"].value_counts().reindex(classes).values.astype(float)
+    class_weights = torch.tensor(
+        counts.sum() / (len(classes) * counts), dtype=torch.float32
+    ).to(device)
+
+    criterion  = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.05)
+    optimizer  = optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=1e-4)
+    scheduler  = CosineAnnealingLR(optimizer, T_max=cfg.epochs)
+    scaler     = torch.amp.GradScaler("cuda") if device.type == "cuda" else None
+    early_stop = EarlyStopping(patience=cfg.patience)
+    best_val, history = 0.0, []
+
+    for epoch in range(1, cfg.epochs + 1):
+        t0 = time.time()
+        tr_loss, tr_acc = run_epoch(model, train_loader, criterion, device,
+                                    optimizer=optimizer, scaler=scaler,
+                                    desc=f"train e{epoch}")
+        vl_loss, vl_acc = run_epoch(model, val_loader, criterion, device,
+                                    desc=f"val   e{epoch}")
+        scheduler.step()
+        elapsed = time.time() - t0
+
+        history.append({
+            "epoch":      epoch,
+            "train_loss": round(tr_loss, 4), "val_loss": round(vl_loss, 4),
+            "train_acc":  round(tr_acc,  4), "val_acc":  round(vl_acc,  4),
+            "elapsed_s":  round(elapsed,  1),
+        })
+        log.info("Epoch %02d/%02d  tr_loss=%.4f  tr_acc=%.4f  "
+                 "vl_loss=%.4f  vl_acc=%.4f  (%.1fs)",
+                 epoch, cfg.epochs, tr_loss, tr_acc, vl_loss, vl_acc, elapsed)
+        mlflow.log_metrics({
+            "train_loss": tr_loss, "val_loss": vl_loss,
+            "train_acc":  tr_acc,  "val_acc":  vl_acc,
+            "lr":         scheduler.get_last_lr()[0],
+        }, step=epoch)
+
+        if vl_acc > best_val:
+            best_val = vl_acc
+            # Everything needed for standalone inference lives in the checkpoint
+            torch.save({
+                "state_dict": model.state_dict(),
+                "classes":    classes,
+                "img_size":   cfg.img_size,
+                "mean":       IMAGENET_MEAN,
+                "std":        IMAGENET_STD,
+                "epoch":      epoch,
+                "val_acc":    vl_acc,
+            }, ckpt_path)
+            log.info("  [checkpoint] New best val_acc=%.4f saved.", best_val)
+
+        if early_stop(vl_acc):
+            log.info("Early stopping at epoch %d (no improvement for %d epochs).",
+                     epoch, cfg.patience)
+            break
+
+    return best_val, history
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -458,18 +512,16 @@ def run_epoch(model, loader, criterion, device,
 # ══════════════════════════════════════════════════════════════════════════════
 
 def evaluate_test_set(model: nn.Module, loader, device, classes: list) -> tuple:
+    """Return (y_true, y_pred, y_prob, report dict, confusion matrix, macro OvR AUROC)."""
     model.eval()
-    all_y, all_p, all_prob = [], [], []
+    all_y, all_prob = [], []
     with torch.no_grad():
         for x, y in tqdm(loader, leave=False, desc="test"):
-            x    = x.to(device)
-            prob = torch.softmax(model(x), dim=1).cpu().numpy()
-            all_prob.append(prob)
-            all_p.append(prob.argmax(1))
+            all_prob.append(torch.softmax(model(x.to(device)), dim=1).cpu().numpy())
             all_y.append(y.numpy())
     y_true = np.concatenate(all_y)
-    y_pred = np.concatenate(all_p)
     y_prob = np.concatenate(all_prob)
+    y_pred = y_prob.argmax(1)
     report = classification_report(y_true, y_pred, target_names=classes,
                                    digits=4, output_dict=True)
     cm     = confusion_matrix(y_true, y_pred).tolist()
@@ -483,13 +535,12 @@ def evaluate_test_set(model: nn.Module, loader, device, classes: list) -> tuple:
 
 def run_validation_gate(best_val_acc: float, test_auroc: float, cfg: Config) -> bool:
     """Return True if the model clears both quality thresholds."""
-    acc_ok  = best_val_acc >= cfg.min_val_acc
-    auroc_ok = test_auroc  >= cfg.min_auroc
-    status = lambda ok: "PASS" if ok else "FAIL"  # noqa: E731
-    log.info("Gate — val_acc:  %.4f  (threshold %.2f) → %s",
-             best_val_acc, cfg.min_val_acc, status(acc_ok))
+    acc_ok   = best_val_acc >= cfg.min_val_acc
+    auroc_ok = test_auroc   >= cfg.min_auroc
+    log.info("Gate — val_acc:    %.4f  (threshold %.2f) → %s",
+             best_val_acc, cfg.min_val_acc, "PASS" if acc_ok else "FAIL")
     log.info("Gate — test_auroc: %.4f  (threshold %.2f) → %s",
-             test_auroc, cfg.min_auroc, status(auroc_ok))
+             test_auroc, cfg.min_auroc, "PASS" if auroc_ok else "FAIL")
     return acc_ok and auroc_ok
 
 
@@ -500,8 +551,7 @@ def run_validation_gate(best_val_acc: float, test_auroc: float, cfg: Config) -> 
 def export_torchscript(model: nn.Module, img_size: int, out: Path) -> Path:
     """Trace the model to TorchScript for portable, framework-free inference."""
     model.eval().cpu()
-    dummy    = torch.randn(1, 3, img_size, img_size)
-    scripted = torch.jit.trace(model, dummy)
+    scripted = torch.jit.trace(model, torch.randn(1, 3, img_size, img_size))
     path     = out / "model.torchscript"
     torch.jit.save(scripted, str(path))
     log.info("TorchScript model saved → %s", path)
@@ -519,10 +569,9 @@ def main() -> None:
         datefmt="%H:%M:%S",
     )
 
-    # ── Stage 1 · Configuration management ───────────────────────────────────
     log.info("══ Stage 1 · Configuration management ══")
-    cfg    = parse_args()
-    out    = Path(cfg.out)
+    cfg = parse_args()
+    out = Path(cfg.out)
     out.mkdir(parents=True, exist_ok=True)
     set_seed(cfg.seed)
     cfg.save(out / "config.json")
@@ -530,14 +579,12 @@ def main() -> None:
     log.info("task=%s | seed=%d | device=%s | epochs=%d | batch=%d | lr=%s",
              cfg.task, cfg.seed, device, cfg.epochs, cfg.batch, cfg.lr)
 
-    # ── Stage 2 · Data acquisition ────────────────────────────────────────────
     log.info("══ Stage 2 · Data acquisition ══")
     download_dataset(cfg)
 
-    # ── Stage 3 · Data validation ─────────────────────────────────────────────
     log.info("══ Stage 3 · Data validation ══")
     df = index_images(cfg)
-    if df.empty or not df["ok"].any():
+    if not df["ok"].any():
         raise FileNotFoundError(
             f"No valid images found under '{cfg.data}' even after download.\n"
             "Expected layouts:\n"
@@ -547,36 +594,17 @@ def main() -> None:
     data_stats = validate_data(df)
     (out / "data_stats.json").write_text(json.dumps(data_stats, indent=2))
 
-    # ── Stage 4 · Feature engineering ────────────────────────────────────────
     log.info("══ Stage 4 · Feature engineering ══")
     train_df, val_df, test_df, classes, class_to_idx = build_splits(df, cfg)
+    test_df[["path", "label"]].to_csv(out / "test_images.csv", index=False)  # used by explain.py
     train_tfm, eval_tfm = build_transforms(cfg.img_size)
-    nw = min(4, os.cpu_count() or 1)
-    train_loader = DataLoader(
-        ImageDataset(train_df, class_to_idx, train_tfm),
-        batch_size=cfg.batch, shuffle=True, num_workers=nw, pin_memory=True,
-    )
-    val_loader = DataLoader(
-        ImageDataset(val_df, class_to_idx, eval_tfm),
-        batch_size=cfg.batch, shuffle=False, num_workers=nw, pin_memory=True,
-    )
-    test_loader = DataLoader(
-        ImageDataset(test_df, class_to_idx, eval_tfm),
-        batch_size=cfg.batch, shuffle=False, num_workers=nw, pin_memory=True,
-    )
+    train_loader = make_loader(train_df, class_to_idx, train_tfm, cfg, shuffle=True)
+    val_loader   = make_loader(val_df,   class_to_idx, eval_tfm,  cfg)
+    test_loader  = make_loader(test_df,  class_to_idx, eval_tfm,  cfg)
 
-    # ── Stage 5 · Experiment tracking (MLflow) ────────────────────────────────
     log.info("══ Stage 5 · Experiment tracking (MLflow) ══")
-    try:
-        import mlflow
-        import mlflow.pytorch
-    except ImportError:
-        log.info("mlflow not found — installing ...")
-        import subprocess
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "mlflow", "-q"])
-        import mlflow          # noqa: F811
-        import mlflow.pytorch  # noqa: F811
-
+    import mlflow
+    import mlflow.pytorch
     mlflow.set_tracking_uri(cfg.mlflow_uri)
     mlflow.set_experiment(cfg.experiment)
     run_name = f"{cfg.task}_{time.strftime('%Y%m%d_%H%M%S')}"
@@ -603,152 +631,70 @@ def main() -> None:
         mlflow.log_artifact(str(out / "config.json"))
         mlflow.log_artifact(str(out / "data_stats.json"))
 
-        # ── Stage 6 · Model building ─────────────────────────────────────────
         log.info("══ Stage 6 · Model building ══")
-        counts = train_df["label"].value_counts().reindex(classes).values.astype(float)
-        class_weights = torch.tensor(
-            counts.sum() / (len(classes) * counts), dtype=torch.float32
-        ).to(device)
+        model = build_model(len(classes)).to(device)
+        n_params = sum(p.numel() for p in model.parameters())
+        log.info("Parameters: %d", n_params)
+        mlflow.log_params({"total_params": n_params, "trainable_params": n_params})
 
-        model     = build_model(len(classes)).to(device)
-        criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.05)
-        optimizer = optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=1e-4)
-        scheduler = CosineAnnealingLR(optimizer, T_max=cfg.epochs)
-        scaler    = torch.amp.GradScaler("cuda") if device.type == "cuda" else None
-
-        total_p     = sum(p.numel() for p in model.parameters())
-        trainable_p = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        log.info("Parameters — total: %d  trainable: %d", total_p, trainable_p)
-        mlflow.log_params({"total_params": total_p, "trainable_params": trainable_p})
-
-        # ── Stage 7 · Training with early stopping ────────────────────────────
         log.info("══ Stage 7 · Training ══")
-        early_stop  = EarlyStopping(patience=cfg.patience)
-        best_val    = 0.0
-        history: list = []
-        ckpt_path   = out / "best_model.pt"
-
-        for epoch in range(cfg.epochs):
-            t0 = time.time()
-            tr_loss, tr_acc = run_epoch(
-                model, train_loader, criterion, device,
-                optimizer=optimizer, scaler=scaler, desc=f"train e{epoch+1}"
-            )
-            vl_loss, vl_acc = run_epoch(
-                model, val_loader, criterion, device, desc=f"val   e{epoch+1}"
-            )
-            scheduler.step()
-            elapsed = time.time() - t0
-
-            row = {
-                "epoch":      epoch + 1,
-                "train_loss": round(tr_loss, 4), "val_loss": round(vl_loss, 4),
-                "train_acc":  round(tr_acc,  4), "val_acc":  round(vl_acc,  4),
-                "elapsed_s":  round(elapsed,  1),
-            }
-            history.append(row)
-            log.info("Epoch %02d/%02d  tr_loss=%.4f  tr_acc=%.4f  "
-                     "vl_loss=%.4f  vl_acc=%.4f  (%.1fs)",
-                     epoch + 1, cfg.epochs, tr_loss, tr_acc, vl_loss, vl_acc, elapsed)
-
-            mlflow.log_metrics({
-                "train_loss": tr_loss, "val_loss": vl_loss,
-                "train_acc":  tr_acc,  "val_acc":  vl_acc,
-                "lr":         scheduler.get_last_lr()[0],
-            }, step=epoch + 1)
-
-            if vl_acc > best_val:
-                best_val = vl_acc
-                torch.save({
-                    "state_dict": model.state_dict(),
-                    "classes":    classes,
-                    "img_size":   cfg.img_size,
-                    "mean":       IMAGENET_MEAN,
-                    "std":        IMAGENET_STD,
-                    "epoch":      epoch + 1,
-                    "val_acc":    vl_acc,
-                }, ckpt_path)
-                log.info("  [checkpoint] New best val_acc=%.4f saved.", best_val)
-
-            if early_stop(vl_acc):
-                log.info("Early stopping triggered at epoch %d "
-                         "(no improvement for %d consecutive epochs).",
-                         epoch + 1, cfg.patience)
-                break
-
+        ckpt_path = out / "best_model.pt"
+        best_val, history = train_model(model, train_loader, val_loader, train_df,
+                                        classes, cfg, device, ckpt_path, mlflow)
         pd.DataFrame(history).to_csv(out / "history.csv", index=False)
         mlflow.log_metric("best_val_acc",   best_val)
         mlflow.log_metric("epochs_trained", len(history))
         mlflow.log_artifact(str(out / "history.csv"))
 
-        # ── Stage 8 · Model evaluation ────────────────────────────────────────
         log.info("══ Stage 8 · Model evaluation ══")
+        # Evaluate the best checkpoint, not the last epoch
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
         model.load_state_dict(ckpt["state_dict"])
-
-        y_true, y_pred, y_prob, report, cm, auc = evaluate_test_set(
+        y_true, y_pred, _, report, cm, auc = evaluate_test_set(
             model, test_loader, device, classes
         )
-
-        summary = {
-            "task":                cfg.task,
-            "best_val_acc":        best_val,
-            "test_macro_auroc":    auc,
-            "test_accuracy":       report["accuracy"],
-            "classification_report": report,
-            "confusion_matrix":    {"labels": classes, "matrix": cm},
-            "classes":             classes,
-            "run_id":              run.info.run_id,
-        }
         report_path = out / "test_report.json"
-        report_path.write_text(json.dumps(summary, indent=2))
-
+        report_path.write_text(json.dumps({
+            "task":                  cfg.task,
+            "best_val_acc":          best_val,
+            "test_macro_auroc":      auc,
+            "test_accuracy":         report["accuracy"],
+            "classification_report": report,
+            "confusion_matrix":      {"labels": classes, "matrix": cm},
+            "classes":               classes,
+            "run_id":                run.info.run_id,
+        }, indent=2))
         mlflow.log_metric("test_macro_auroc", auc)
         mlflow.log_metric("test_accuracy",    report["accuracy"])
         mlflow.log_artifact(str(report_path))
-
         log.info("\n%s", classification_report(y_true, y_pred,
                                                target_names=classes, digits=4))
         log.info("Test macro AUROC: %.4f", auc)
 
-        # ── Stage 9 · Model validation gate ───────────────────────────────────
         log.info("══ Stage 9 · Model validation gate ══")
         gate_passed = run_validation_gate(best_val, auc, cfg)
         mlflow.log_metric("gate_passed", int(gate_passed))
         mlflow.set_tag("gate_passed", str(gate_passed))
 
-        # ── Stage 10 · Model export & registry ────────────────────────────────
         log.info("══ Stage 10 · Model export & registry ══")
-        ts_path = export_torchscript(model, cfg.img_size, out)
-        mlflow.log_artifact(str(ts_path))
-
-        # Always log model artifacts; only register in the Model Registry if gate passes
-        model.to(device)
+        mlflow.log_artifact(str(export_torchscript(model, cfg.img_size, out)))
+        # Always log the model; register it in the Model Registry only if the gate passes
         mlflow.pytorch.log_model(
             model,
             name="pytorch_model",
             registered_model_name=cfg.experiment if gate_passed else None,
             serialization_format="pickle",
         )
-
         if gate_passed:
             log.info("Model registered in MLflow Model Registry as '%s'.", cfg.experiment)
         else:
-            log.warning(
-                "Model NOT registered — quality gate failed "
-                "(val_acc=%.4f threshold=%.2f | auroc=%.4f threshold=%.2f).",
-                best_val, cfg.min_val_acc, auc, cfg.min_auroc,
-            )
+            log.warning("Model NOT registered — quality gate failed.")
 
-        log.info("══════════════════════════════════════════")
-        log.info("Pipeline complete for task: %s", cfg.task)
-        log.info("  Artifacts : %s/", cfg.out)
-        log.info("  Run name  : %s", run_name)
-        log.info("  Run ID    : %s", run.info.run_id)
-        log.info("  val_acc   : %.4f  |  test_auroc : %.4f", best_val, auc)
-        log.info("  Gate      : %s", "PASS" if gate_passed else "FAIL")
-        log.info("View UI     : mlflow ui --backend-store-uri %s", cfg.mlflow_uri)
-        log.info("══════════════════════════════════════════")
+        log.info("Pipeline complete | task=%s | run=%s | val_acc=%.4f | "
+                 "test_auroc=%.4f | gate=%s | artifacts=%s/",
+                 cfg.task, run.info.run_id, best_val, auc,
+                 "PASS" if gate_passed else "FAIL", cfg.out)
+        log.info("View UI: mlflow ui --backend-store-uri %s", cfg.mlflow_uri)
 
 
 if __name__ == "__main__":
